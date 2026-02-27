@@ -1,0 +1,18 @@
+image:
+  repository: devopspikachu/hv-assignment-eight
+  tag: frontend
+  pullPolicy: Always
+imagePullSecrets:
+  - name: docker-hub-secret
+env:
+  - name: REACT_APP_API_BASE_URL
+    value: "http://backend:3001"
+service:
+  type: NodePort
+  port: 3000
+serviceAccount:
+  create: false
+ingress:
+  enabled: false
+autoscaling:
+  enabled: false

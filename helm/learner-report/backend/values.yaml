@@ -1,0 +1,22 @@
+image:
+  repository: devopspikachu/hv-assignment-eight
+  tag: backend
+  pullPolicy: Always
+imagePullSecrets:
+  - name: docker-hub-secret
+env:
+  - name: ATLAS_URI
+    value: <ATLAS_URI_PLACEHOLDER>
+  - name: HASH_KEY
+    value: <HASH_KEY_PLACEHOLDER>
+  - name: JWT_SECRET_KEY
+    value: <JWT_SECRET_KEY_PLACEHOLDER>
+service:
+  type: NodePort
+  port: 3001
+serviceAccount:
+  create: false
+ingress:
+  enabled: false
+autoscaling:
+  enabled: false
