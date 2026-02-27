@@ -1,0 +1,396 @@
+pipeline {
+    agent any
+
+    environment {
+        JL_EC2_IP                           = credentials('JL_ASSIGNMENT_EIGHT_EC2_IP_ADDRESS')
+        JL_ASSIGNMENT_EIGHT_MONGO_ATLAS_URI = credentials('JL_ASSIGNMENT_EIGHT_MONGO_ATLAS_URI')
+        JL_ASSIGNMENT_EIGHT_HASH_KEY        = credentials('JL_ASSIGNMENT_EIGHT_HASH_KEY')
+        JL_ASSIGNMENT_EIGHT_JWT_SECRET_KEY  = credentials('JL_ASSIGNMENT_EIGHT_JWT_SECRET_KEY')
+        JL_EC2_USER                         = credentials('JL_EC2_USER')
+        JL_ASSIGNMENT_EIGHT_DOCKER_REPOSITORY_NAME = credentials('JL_ASSIGNMENT_EIGHT_DOCKER_REPOSITORY_NAME')
+        JL_WORK_RELATED_EMAIL_ADDRESS       = credentials('JL_WORK_RELATED_EMAIL_ADDRESS')
+        DOCKER_HUB_CREDS                    = 'JL_DOCKERHUB_CREDS'
+        BACKEND_PORT                        = "3001"
+        WORK_DIR                            = "Assignment_08_DevOps"
+        GITHUB_REPO                         = "https://github.com/JOYSTON-LEWIS/Assignment_08_DevOps"
+    }
+
+    stages {
+        stage('Git Pull') {
+            steps {
+                git branch: 'main', url: "${env.GITHUB_REPO}"
+
+                script {
+                    def backendCommit = sh(returnStdout: true, script: "cd backend && git rev-parse HEAD").trim()
+                    def frontendCommit = sh(returnStdout: true, script: "cd frontend && git rev-parse HEAD").trim()
+
+                    writeFile file: '.backend_commit', text: backendCommit
+                    writeFile file: '.frontend_commit', text: frontendCommit
+
+                    def backendChanged = true
+                    def frontendChanged = true
+
+                    if (fileExists('.backend_commit.old')) {
+                        def old = readFile('.backend_commit.old').trim()
+                        backendChanged = (old != backendCommit)
+                    }
+                    if (fileExists('.frontend_commit.old')) {
+                        def old = readFile('.frontend_commit.old').trim()
+                        frontendChanged = (old != frontendCommit)
+                    }
+
+                    if (!backendChanged && !frontendChanged) {
+                        echo "No new commits found in backend or frontend. Skipping build."
+                        currentBuild.result = 'SUCCESS'
+                        error('Build skipped due to no changes.')
+                    }
+                }
+            }
+        }
+
+
+stage('SSH into EC2 & Setup Tools') {
+    steps {
+        sshagent (credentials: ['JL_EC2_SSH_PRIVATE_KEY']) {
+            script {
+                def SSH_USER = env.JL_EC2_USER
+                def SSH_IP = env.JL_EC2_IP
+                def REPO = env.GITHUB_REPO
+                def CRICTL_VERSION = "v1.29.0"
+                def CRI_DOCKERD_VERSION = "0.3.1"
+                def MINIKUBE_VERSION = "v1.33.1"
+                def GO_VERSION = "1.18.3"
+
+                sh """
+                ssh -o StrictHostKeyChecking=no $SSH_USER@$SSH_IP << 'EOF'
+echo "✅ Connected to EC2"
+
+# Update system and install base tools
+sudo apt-get update -y
+sudo apt-get install -y docker.io curl git apt-transport-https software-properties-common conntrack socat ebtables ethtool gcc unzip
+
+# Install crictl
+curl -LO https://github.com/kubernetes-sigs/cri-tools/releases/download/${CRICTL_VERSION}/crictl-${CRICTL_VERSION}-linux-amd64.tar.gz
+sudo tar -C /usr/local/bin -xzf crictl-${CRICTL_VERSION}-linux-amd64.tar.gz
+rm crictl-${CRICTL_VERSION}-linux-amd64.tar.gz
+
+# Install Go ${GO_VERSION}
+wget https://go.dev/dl/go${GO_VERSION}.linux-amd64.tar.gz
+sudo rm -rf /usr/local/go
+sudo tar -C /usr/local -xzf go${GO_VERSION}.linux-amd64.tar.gz
+rm go${GO_VERSION}.linux-amd64.tar.gz
+export PATH=\$PATH:/usr/local/go/bin
+echo 'export PATH=\$PATH:/usr/local/go/bin' >> ~/.bashrc
+
+# Verify Go version
+go version
+
+# Install cri-dockerd
+git clone https://github.com/Mirantis/cri-dockerd.git
+cd cri-dockerd
+git checkout v${CRI_DOCKERD_VERSION}
+go build -o cri-dockerd
+sudo install -o root -g root -m 0755 cri-dockerd /usr/local/bin/cri-dockerd
+sudo cp -a packaging/systemd/* /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable cri-docker.service
+sudo systemctl enable --now cri-docker.socket
+sudo systemctl status cri-docker.service || true
+cd .. && rm -rf cri-dockerd
+
+# Add user to docker group
+sudo usermod -aG docker \$USER || true
+newgrp docker || true
+
+# Fix kernel protection
+echo fs.protected_regular=0 | sudo tee -a /etc/sysctl.conf
+sudo sysctl -p
+
+# Install kubectl
+curl -LO https://dl.k8s.io/release/v1.30.1/bin/linux/amd64/kubectl
+chmod +x kubectl && sudo mv kubectl /usr/local/bin/
+
+# Install Minikube
+curl -Lo minikube https://storage.googleapis.com/minikube/releases/${MINIKUBE_VERSION}/minikube-linux-amd64
+chmod +x minikube && sudo mv minikube /usr/local/bin/
+
+# Install Helm
+curl https://raw.githubusercontent.com/helm/helm/master/scripts/get-helm-3 | bash
+
+# Reset Minikube setup
+sudo minikube delete --all --purge || true
+rm -rf ~/.minikube ~/.kube
+
+# Start Minikube with none driver
+sudo minikube start --driver=none --cpus=2 --memory=2048 --force --wait-timeout=5m0s
+
+# Setup kubeconfig for root and user
+mkdir -p ~/.kube ~/.minikube
+sudo cp -r ~/.kube ~/.minikube /root/ || true
+export KUBECONFIG=\$HOME/.kube/config
+
+# Check Minikube status
+minikube status
+
+# Clone your repo
+mkdir -p ~/devops8 && cd ~/devops8
+rm -rf Assignment_08_DevOps
+git clone ${REPO}
+EOF
+                """
+            }
+        }
+    }
+}
+
+
+
+        stage('Build & Push Docker Images to Docker Hub') {
+    steps {
+        sshagent (credentials: ['JL_EC2_SSH_PRIVATE_KEY']) {
+            withCredentials([usernamePassword(credentialsId: "${DOCKER_HUB_CREDS}", usernameVariable: 'DOCKER_USERNAME', passwordVariable: 'DOCKER_PASSWORD')]) {
+                script {
+                    def SSH_USER = env.JL_EC2_USER
+                    def SSH_IP = env.JL_EC2_IP
+                    def DOCKER_BASE_URL = env.JL_ASSIGNMENT_EIGHT_DOCKER_REPOSITORY_NAME
+                    def DOCKER_USERNAME = DOCKER_BASE_URL.tokenize('/')[-1]
+                    def DOCKER_REPO_NAME = "hv-assignment-eight"
+                    def BACKEND = "${DOCKER_USERNAME}/${DOCKER_REPO_NAME}"
+                    def FRONTEND = "${DOCKER_USERNAME}/${DOCKER_REPO_NAME}"
+                    def BACKEND_TAG = "backend"
+                    def FRONTEND_TAG = "frontend"
+
+                    def MONGO = env.JL_ASSIGNMENT_EIGHT_MONGO_ATLAS_URI
+                    def HASH = env.JL_ASSIGNMENT_EIGHT_HASH_KEY
+                    def JWT = env.JL_ASSIGNMENT_EIGHT_JWT_SECRET_KEY
+                    def PORT = env.BACKEND_PORT
+
+                    sh """
+                    ssh -o StrictHostKeyChecking=no ${SSH_USER}@${SSH_IP} << EOF
+                        cd ~/devops8/${WORK_DIR}
+
+                        # Login to Docker Hub FIRST
+                        echo "$DOCKER_PASSWORD" | docker login -u "$DOCKER_USERNAME" --password-stdin
+
+                        # Set ENV files
+                        cat <<EOT > backend/config.env
+ATLAS_URI=${MONGO}
+HASH_KEY=${HASH}
+JWT_SECRET_KEY=${JWT}
+EOT
+
+                        cat <<EOT > frontend/.env
+REACT_APP_API_BASE_URL=http://${SSH_IP}:${PORT}
+EOT
+
+                        # Build and push backend image
+                        cd backend
+                        docker build -t ${BACKEND}:${BACKEND_TAG} .
+                        docker push ${BACKEND}:${BACKEND_TAG}
+
+                        # Build and push frontend image
+                        cd ../frontend
+                        docker build -t ${FRONTEND}:${FRONTEND_TAG} .
+                        docker push ${FRONTEND}:${FRONTEND_TAG}
+EOF
+                    """
+                }
+            }
+        }
+    }
+}
+
+stage('Create imagePullSecret in Kubernetes') {
+    steps {
+        sshagent (credentials: ['JL_EC2_SSH_PRIVATE_KEY']) {
+            withCredentials([
+                usernamePassword(
+                    credentialsId: "${DOCKER_HUB_CREDS}",
+                    usernameVariable: 'DOCKER_USERNAME',
+                    passwordVariable: 'DOCKER_PASSWORD'
+                )
+            ]) {
+                script {
+                    def SSH_USER = env.JL_EC2_USER
+                    def SSH_IP = env.JL_EC2_IP
+                    def DOCKER_EMAIL = env.JL_WORK_RELATED_EMAIL_ADDRESS
+
+                    sh """
+                    ssh -o StrictHostKeyChecking=no ${SSH_USER}@${SSH_IP} << EOF
+                        echo "🔐 Creating docker-hub-secret in Kubernetes"
+
+                        export KUBECONFIG=\$HOME/.kube/config
+
+                        # Delete if it already exists
+                        kubectl delete secret docker-hub-secret --ignore-not-found
+
+                        # Create the docker registry secret
+                        kubectl create secret docker-registry docker-hub-secret \\
+                          --docker-username="\$DOCKER_USERNAME" \\
+                          --docker-password="\$DOCKER_PASSWORD" \\
+                          --docker-email=${DOCKER_EMAIL}
+
+                        echo "✅ docker-hub-secret created"
+EOF
+                    """
+                }
+            }
+        }
+    }
+}
+
+
+
+        stage('Generate Helm Charts & Deploy') {
+            steps {
+                sshagent (credentials: ['JL_EC2_SSH_PRIVATE_KEY']) {
+                    script {
+                        def SSH_USER = env.JL_EC2_USER
+                        def SSH_IP = env.JL_EC2_IP
+                        def PORT = env.BACKEND_PORT
+                        def MONGO = env.JL_ASSIGNMENT_EIGHT_MONGO_ATLAS_URI
+                        def HASH = env.JL_ASSIGNMENT_EIGHT_HASH_KEY
+                        def JWT = env.JL_ASSIGNMENT_EIGHT_JWT_SECRET_KEY
+                        def DOCKER_BASE_URL = env.JL_ASSIGNMENT_EIGHT_DOCKER_REPOSITORY_NAME
+                        def DOCKER_USERNAME = DOCKER_BASE_URL.tokenize('/')[-1]
+                        def DOCKER_REPO_NAME = "hv-assignment-eight"
+                        def BACKEND_TAG = "backend"
+                        def FRONTEND_TAG = "frontend"
+
+                        sh """
+                        ssh -o StrictHostKeyChecking=no ${SSH_USER}@${SSH_IP} << EOF
+                            cd ~/devops8/${WORK_DIR}
+                            rm -rf helm/learner-report
+                            mkdir -p helm/learner-report
+                            cd helm/learner-report
+
+                            # Export kubeconfig to use with helm/kubectl
+                            export KUBECONFIG=\$HOME/.kube/config
+
+                            helm create backend
+                            helm create frontend
+
+                            rm -rf backend/templates/tests frontend/templates/tests
+
+                            cat <<EOT > backend/values.yaml
+image:
+  repository: ${DOCKER_USERNAME}/${DOCKER_REPO_NAME}
+  tag: ${BACKEND_TAG}
+  pullPolicy: Always
+imagePullSecrets:
+  - name: docker-hub-secret
+env:
+  - name: ATLAS_URI
+    value: "${MONGO}"
+  - name: HASH_KEY
+    value: "${HASH}"
+  - name: JWT_SECRET_KEY
+    value: "${JWT}"
+service:
+  type: NodePort
+  port: 3001
+  targetPort: 3001
+serviceAccount:
+  create: false
+ingress:
+  enabled: false
+autoscaling:
+  enabled: false
+EOT
+
+                            cat <<EOT > frontend/values.yaml
+image:
+  repository: ${DOCKER_USERNAME}/${DOCKER_REPO_NAME}
+  tag: ${FRONTEND_TAG}
+  pullPolicy: Always
+imagePullSecrets:
+  - name: docker-hub-secret
+env:
+  - name: REACT_APP_API_BASE_URL
+    value: "http://${SSH_IP}:${PORT}"
+service:
+  type: NodePort
+  port: 3000
+  targetPort: 3000
+serviceAccount:
+  create: false
+ingress:
+  enabled: false
+autoscaling:
+  enabled: false
+EOT
+
+                            helm upgrade --install backend ./backend
+                            helm upgrade --install frontend ./frontend
+EOF
+                        """
+                    }
+                }
+            }
+        }
+
+stage('Post-Deploy Validation') {
+    steps {
+        sshagent (credentials: ['JL_EC2_SSH_PRIVATE_KEY']) {
+            script {
+                def SSH_USER = env.JL_EC2_USER
+                def SSH_IP = env.JL_EC2_IP
+
+                sh """
+                ssh -o StrictHostKeyChecking=no ${SSH_USER}@${SSH_IP} << EOF
+                    
+                    # Export kubeconfig to use with helm/kubectl
+                    export KUBECONFIG=\$HOME/.kube/config
+                    
+                    echo "🔍 Verifying Helm Deployment"
+                    helm list
+
+                    echo "🔍 Verifying Kubernetes Pods and Services"
+                    minikube kubectl -- get all
+
+                    echo "⏳ Waiting for Backend pod to be Ready..."
+                    timeout=90
+                    while [ "\$timeout" -gt 0 ]; do
+                      status=\$(kubectl get pods -l app.kubernetes.io/name=backend -o jsonpath="{.items[0].status.containerStatuses[0].ready}" 2>/dev/null)
+                      if [ "\$status" = "true" ]; then
+                        echo "✅ Backend pod is Ready"
+                        break
+                      fi
+                      echo "⏳ Still waiting for backend... (\$timeout seconds left)"
+                      sleep 5
+                      timeout=\$((timeout - 5))
+                    done
+
+                    echo "⏳ Waiting for Frontend pod to be Ready..."
+                    timeout=90
+                    while [ "\$timeout" -gt 0 ]; do
+                      status=\$(kubectl get pods -l app.kubernetes.io/name=frontend -o jsonpath="{.items[0].status.containerStatuses[0].ready}" 2>/dev/null)
+                      if [ "\$status" = "true" ]; then
+                        echo "✅ Frontend pod is Ready"
+                        break
+                      fi
+                      echo "⏳ Still waiting for frontend... (\$timeout seconds left)"
+                      sleep 5
+                      timeout=\$((timeout - 5))
+                    done
+
+                    echo "🌐 Access URL for Frontend:"
+                    frontend_url=\$(minikube service frontend --url)
+                    echo "✅ Frontend running at: \$frontend_url"
+
+                    echo "🌐 Access URL for Backend:"
+                    backend_url=\$(minikube service backend --url)
+                    echo "✅ Backend running at: \$backend_url"
+
+                    echo "🎉 BUILD SUCCESSFUL!"
+EOF
+                """
+            }
+        }
+    }
+}
+
+
+
+    }
+}

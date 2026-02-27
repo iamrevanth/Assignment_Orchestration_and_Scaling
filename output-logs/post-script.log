@@ -1,0 +1,36 @@
+🔍 Verifying Helm Deployment
+NAME    	NAMESPACE	REVISION	UPDATED                                	STATUS  	CHART         	APP VERSION
+backend 	default  	1       	2025-07-13 03:12:03.019669978 +0000 UTC	deployed	backend-0.1.0 	1.16.0     
+frontend	default  	1       	2025-07-13 03:12:03.39056647 +0000 UTC 	deployed	frontend-0.1.0	1.16.0     
+🔍 Verifying Kubernetes Pods and Services
+NAME                            READY   STATUS              RESTARTS   AGE
+pod/backend-76b99d99fb-8c6mp    0/1     ContainerCreating   0          6s
+pod/frontend-7697d4c96f-h5t9x   0/1     ContainerCreating   0          6s
+
+NAME                 TYPE        CLUSTER-IP      EXTERNAL-IP   PORT(S)          AGE
+service/backend      NodePort    10.103.72.172   <none>        3001:30809/TCP   6s
+service/frontend     NodePort    10.96.184.156   <none>        3000:32730/TCP   6s
+service/kubernetes   ClusterIP   10.96.0.1       <none>        443/TCP          34s
+
+NAME                       READY   UP-TO-DATE   AVAILABLE   AGE
+deployment.apps/backend    0/1     1            0           6s
+deployment.apps/frontend   0/1     1            0           6s
+
+NAME                                  DESIRED   CURRENT   READY   AGE
+replicaset.apps/backend-76b99d99fb    1         1         0       6s
+replicaset.apps/frontend-7697d4c96f   1         1         0       6s
+⏳ Waiting for Backend pod to be Ready...
+⏳ Still waiting for backend... (90 seconds left)
+✅ Backend pod is Ready
+🌐 Starting port-forward: Backend (3101 → 3001)...
+✅ Backend accessible at: http://65.0.139.200:3101
+⏳ Waiting for Frontend pod to be Ready...
+⏳ Still waiting for frontend... (90 seconds left)
+⏳ Still waiting for frontend... (85 seconds left)
+⏳ Still waiting for frontend... (80 seconds left)
+⏳ Still waiting for frontend... (75 seconds left)
+⏳ Still waiting for frontend... (70 seconds left)
+⏳ Still waiting for frontend... (65 seconds left)
+✅ Frontend pod is Ready
+🌐 Starting port-forward: Frontend (3100 → 3000)...
+✅ Frontend accessible at: http://65.0.139.200:3100

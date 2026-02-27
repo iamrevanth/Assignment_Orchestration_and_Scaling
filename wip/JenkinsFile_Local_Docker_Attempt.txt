@@ -1,0 +1,263 @@
+pipeline {
+    agent any
+
+    environment {
+        JL_EC2_IP                           = credentials('JL_ASSIGNMENT_EIGHT_EC2_IP_ADDRESS')
+        JL_ASSIGNMENT_EIGHT_MONGO_ATLAS_URI = credentials('JL_ASSIGNMENT_EIGHT_MONGO_ATLAS_URI')
+        JL_ASSIGNMENT_EIGHT_HASH_KEY        = credentials('JL_ASSIGNMENT_EIGHT_HASH_KEY')
+        JL_ASSIGNMENT_EIGHT_JWT_SECRET_KEY  = credentials('JL_ASSIGNMENT_EIGHT_JWT_SECRET_KEY')
+        JL_EC2_USER                         = credentials('JL_EC2_USER')
+        BACKEND_CONTAINER_NAME              = "assignment-eight-backend"
+        FRONTEND_CONTAINER_NAME             = "assignment-eight-frontend"
+        BACKEND_PORT                        = "3001"
+        WORK_DIR                            = "Assignment_08_DevOps"
+        GITHUB_REPO                         = "https://github.com/JOYSTON-LEWIS/Assignment_08_DevOps"
+    }
+
+    stages {
+        stage('Git Pull') {
+            steps {
+                git branch: 'main', url: "${env.GITHUB_REPO}"
+
+                script {
+                    def backendCommit = sh(returnStdout: true, script: "cd backend && git rev-parse HEAD").trim()
+                    def frontendCommit = sh(returnStdout: true, script: "cd frontend && git rev-parse HEAD").trim()
+
+                    writeFile file: '.backend_commit', text: backendCommit
+                    writeFile file: '.frontend_commit', text: frontendCommit
+
+                    def backendChanged = true
+                    def frontendChanged = true
+
+                    if (fileExists('.backend_commit.old')) {
+                        def old = readFile('.backend_commit.old').trim()
+                        backendChanged = (old != backendCommit)
+                    }
+                    if (fileExists('.frontend_commit.old')) {
+                        def old = readFile('.frontend_commit.old').trim()
+                        frontendChanged = (old != frontendCommit)
+                    }
+
+                    if (!backendChanged && !frontendChanged) {
+                        echo "No new commits found in backend or frontend. Skipping build."
+                        currentBuild.result = 'SUCCESS'
+                        error('Build skipped due to no changes.')
+                    }
+                }
+            }
+        }
+
+
+
+        stage('SSH into EC2 & Setup Tools') {
+            steps {
+                sshagent (credentials: ['JL_EC2_SSH_PRIVATE_KEY']) {
+                    script {
+                        def SSH_USER = env.JL_EC2_USER
+                        def SSH_IP = env.JL_EC2_IP
+                        def REPO = env.GITHUB_REPO
+
+                        sh """
+                        ssh -o StrictHostKeyChecking=no $SSH_USER@$SSH_IP << EOF
+echo "✅ Connected to EC2"
+
+# Update system and install tools
+sudo apt-get update -y
+sudo apt-get install -y docker.io curl git apt-transport-https software-properties-common conntrack
+
+# Add user to docker group
+sudo usermod -aG docker \$(whoami)
+
+# Fix kernel file protection issue
+sudo sysctl fs.protected_regular=0
+
+# Install kubectl
+curl -LO https://dl.k8s.io/release/v1.30.1/bin/linux/amd64/kubectl
+chmod +x kubectl && sudo mv kubectl /usr/local/bin/
+
+# Install Minikube
+curl -Lo minikube https://storage.googleapis.com/minikube/releases/latest/minikube-linux-amd64
+chmod +x minikube && sudo mv minikube /usr/local/bin/
+
+# Install Helm
+curl https://raw.githubusercontent.com/helm/helm/master/scripts/get-helm-3 | bash
+
+# Delete and reset Minikube
+minikube delete --all --purge || true
+rm -rf ~/.minikube ~/.kube
+
+# Start Minikube using Docker driver (non-root)
+minikube start --driver=docker --cpus=2 --memory=2048 --force --wait-timeout=5m0s
+
+# Clone the repo
+mkdir -p ~/devops8 && cd ~/devops8
+rm -rf Assignment_08_DevOps
+git clone $REPO
+
+EOF
+                        """
+                    }
+                }
+            }
+        }
+
+
+
+        stage('Build Docker Images') {
+            steps {
+                sshagent (credentials: ['JL_EC2_SSH_PRIVATE_KEY']) {
+                    script {
+                        def SSH_USER = env.JL_EC2_USER
+                        def SSH_IP = env.JL_EC2_IP
+                        def BACKEND = env.BACKEND_CONTAINER_NAME
+                        def FRONTEND = env.FRONTEND_CONTAINER_NAME
+                        def PORT = env.BACKEND_PORT
+                        def MONGO = env.JL_ASSIGNMENT_EIGHT_MONGO_ATLAS_URI
+                        def HASH = env.JL_ASSIGNMENT_EIGHT_HASH_KEY
+                        def JWT = env.JL_ASSIGNMENT_EIGHT_JWT_SECRET_KEY
+
+                        sh """
+                        ssh -o StrictHostKeyChecking=no ${SSH_USER}@${SSH_IP} << EOF
+                            cd ~/devops8/${WORK_DIR}
+
+                            cat <<EOT > backend/config.env
+ATLAS_URI=${MONGO}
+HASH_KEY=${HASH}
+JWT_SECRET_KEY=${JWT}
+EOT
+
+                            cat <<EOT > frontend/.env
+REACT_APP_API_BASE_URL=http://${SSH_IP}:${PORT}
+EOT
+
+                            # Use Minikube's Docker daemon
+                            eval \$(minikube docker-env)
+
+                            cd backend
+                            docker build -t ${BACKEND}:v1 .
+
+                            cd ../frontend
+                            docker build -t ${FRONTEND}:v1 .
+EOF
+                        """
+                    }
+                }
+            }
+        }
+
+        stage('Generate Helm Charts & Deploy') {
+            steps {
+                sshagent (credentials: ['JL_EC2_SSH_PRIVATE_KEY']) {
+                    script {
+                        def SSH_USER = env.JL_EC2_USER
+                        def SSH_IP = env.JL_EC2_IP
+                        def BACKEND = env.BACKEND_CONTAINER_NAME
+                        def FRONTEND = env.FRONTEND_CONTAINER_NAME
+                        def PORT = env.BACKEND_PORT
+                        def MONGO = env.JL_ASSIGNMENT_EIGHT_MONGO_ATLAS_URI
+                        def HASH = env.JL_ASSIGNMENT_EIGHT_HASH_KEY
+                        def JWT = env.JL_ASSIGNMENT_EIGHT_JWT_SECRET_KEY
+
+                        sh """
+                        ssh -o StrictHostKeyChecking=no ${SSH_USER}@${SSH_IP} << EOF
+                            cd ~/devops8/${WORK_DIR}
+                            rm -rf helm/learner-report
+                            mkdir -p helm/learner-report
+                            cd helm/learner-report
+
+                            helm create backend
+                            helm create frontend
+
+                            rm -rf backend/templates/tests frontend/templates/tests
+
+                            cat <<EOT > backend/values.yaml
+image:
+  repository: ${BACKEND}
+  tag: "v1"
+  pullPolicy: IfNotPresent
+env:
+  - name: ATLAS_URI
+    value: "${MONGO}"
+  - name: HASH_KEY
+    value: "${HASH}"
+  - name: JWT_SECRET_KEY
+    value: "${JWT}"
+service:
+  type: NodePort
+  port: 3001
+serviceAccount:
+  create: false
+ingress:
+  enabled: false
+autoscaling:
+  enabled: false
+EOT
+
+                            cat <<EOT > frontend/values.yaml
+image:
+  repository: ${FRONTEND}
+  tag: "v1"
+  pullPolicy: IfNotPresent
+env:
+  - name: REACT_APP_API_BASE_URL
+    value: "http://${SSH_IP}:${PORT}"
+service:
+  type: NodePort
+  port: 3000
+serviceAccount:
+  create: false
+ingress:
+  enabled: false
+autoscaling:
+  enabled: false
+EOT
+
+                            helm install backend ./backend
+                            helm install frontend ./frontend
+EOF
+                        """
+                    }
+                }
+            }
+        }
+
+        stage('Post-Deploy Validation') {
+    steps {
+        sshagent (credentials: ['JL_EC2_SSH_PRIVATE_KEY']) {
+            script {
+                def SSH_USER = env.JL_EC2_USER
+                def SSH_IP = env.JL_EC2_IP
+
+                sh """
+                ssh -o StrictHostKeyChecking=no ${SSH_USER}@${SSH_IP} << EOF
+                    echo "🔍 Verifying Helm Deployment"
+                    helm list
+
+                    echo "🔍 Verifying Kubernetes Pods and Services"
+                    minikube kubectl -- get all
+
+                    echo "⏳ Waiting for Frontend pod to be Ready..."
+                    timeout=90
+                    while [ \$timeout -gt 0 ]; do
+                      status=\$(kubectl get pods -l app.kubernetes.io/name=frontend -o jsonpath="{.items[0].status.containerStatuses[0].ready}" 2>/dev/null)
+                      if [ "\$status" == "true" ]; then
+                        echo "✅ Frontend pod is Ready"
+                        break
+                      fi
+                      echo "⏳ Still waiting... (\$timeout seconds left)"
+                      sleep 5
+                      timeout=\$((timeout - 5))
+                    done
+
+                    echo "🌐 Access URL for Frontend"
+                    minikube service frontend --url
+EOF
+                """
+            }
+        }
+    }
+}
+
+
+    }
+}
